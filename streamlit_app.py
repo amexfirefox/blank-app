@@ -3,7 +3,7 @@ import os, time, hmac, hashlib, json
 from urllib import request, parse, error
 import streamlit as st
 
-BASE = "https://api.binance.com"
+BASE = "https://api1.binance.com"
 
 KEY    = st.secrets.get("BINANCE_KEY", "")
 SECRET = st.secrets.get("BINANCE_SECRET", "")
