@@ -1,87 +1,74 @@
-# app.py — Streamlit: APR Matrix с обходом 451 через ротацию эндпоинтов Binance
-import os, time, hmac, hashlib, json
+# app.py — ONE-FILE Streamlit: APR Matrix (Binance Dual Investment)
+# - Прямое подключение к Binance с ротацией эндпоинтов
+# - Автопереход на PROXY_BASE при 451 (restricted location)
+# - Подсветка максимума и стрелки тренда по pid
+import json, time, hmac, hashlib
 from urllib import request, parse, error
 import streamlit as st
 
-# ===== Настройка ключей =====
-KEY    = st.secrets.get("BINANCE_KEY", "")
-SECRET = st.secrets.get("BINANCE_SECRET", "")
-# Переопределить список баз можно секретом BINANCE_BASES="https://api-gcp.binance.com,https://api4.binance.com"
-BASES  = [u.strip() for u in st.secrets.get("BINANCE_BASES", "").split(",") if u.strip()] or [
+# ========= Secrets / Настройки =========
+BINANCE_KEY    = st.secrets.get("BINANCE_KEY", "")
+BINANCE_SECRET = st.secrets.get("BINANCE_SECRET", "")
+PROXY_BASE     = st.secrets.get("PROXY_BASE", "").rstrip("/")
+# можно переопределить список хостов одной строкой через запятую:
+BASES = [u.strip() for u in st.secrets.get("BINANCE_BASES", "").split(",") if u.strip()] or [
     "https://api-gcp.binance.com",
     "https://api4.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com",
-    "https://api.binance.com",  # оставим последним
+    "https://api.binance.com",  # последним
 ]
-
-USER_AGENT = "apr-onefile-rotating/1.0"
+UA = "apr-onefile/1.1"
 
 st.set_page_config(page_title="APR Matrix (Binance Dual Investment)", layout="wide")
 st.title("APR Matrix — Binance Dual Investment (ETH)")
 
-if not KEY or not SECRET:
-    st.error("Добавь BINANCE_KEY и BINANCE_SECRET в Settings → Secrets (только read-only).")
-    st.stop()
-
-# Служебная переменная: какой базовый URL сработал
-if "LAST_BASE" not in st.session_state:
-    st.session_state["LAST_BASE"] = ""
-
-# ===== HTTP helpers с ротацией баз =====
+# ========= HTTP helpers =========
 def http_get(url, headers=None, timeout=15):
-    req = request.Request(url, headers=headers or {"User-Agent": USER_AGENT})
+    req = request.Request(url, headers=headers or {"User-Agent": UA})
     try:
         with request.urlopen(req, timeout=timeout) as resp:
             return resp.getcode(), resp.read().decode("utf-8")
     except error.HTTPError as e:
         body = ""
-        try:
-            body = e.read().decode("utf-8", "ignore")
-        except Exception:
-            pass
+        try: body = e.read().decode("utf-8", "ignore")
+        except: pass
         return e.code, body
-    except Exception as e:
-        raise
 
 def http_get_any(path_with_query: str, headers=None, timeout=15):
     """
-    Перебирает BASES и возвращает (code, body) с первого успешного ответа (2xx).
-    Пропускает 451 и ответы, где в тексте упомянуто 'Eligibility'/'restricted location'.
+    Перебираем альтернативные базы Binance. Пропускаем 451 и ответы с текстом
+    про Eligibility/restricted location.
     """
-    last_msg = None
+    last = None
     for base in BASES:
-        try:
-            code, body = http_get(base + path_with_query, headers=headers, timeout=timeout)
-            # Binance иногда отдаёт 403 с текстом про Eligibility — считаем как блокировку
-            restricted = ("Eligibility" in (body or "")) or ("restricted location" in (body or "") ) or (code == 451)
-            if 200 <= (code or 0) < 300 and not restricted:
-                st.session_state["LAST_BASE"] = base
-                return code, body
-            # сохраняем последнюю ошибку и пробуем следующий base
-            last_msg = f"{base} → HTTP {code}; {body[:160].replace(chr(10),' ')}"
-        except Exception as e:
-            last_msg = f"{base} → {type(e).__name__}: {e}"
-    raise RuntimeError(last_msg or "All endpoints failed")
-
-def server_time_ms():
-    code, body = http_get_any("/api/v3/time")
-    if code != 200:
-        raise RuntimeError(f"time error: {code} {body[:200]}")
-    return json.loads(body)["serverTime"]
+        code, body = http_get(base + path_with_query, headers=headers, timeout=timeout)
+        txt = body or ""
+        restricted = (code == 451) or ("Eligibility" in txt) or ("restricted location" in txt)
+        if 200 <= (code or 0) < 300 and not restricted:
+            return base, code, body
+        last = f"{base} → HTTP {code}; {txt[:160].replace(chr(10),' ')}"
+    raise RuntimeError(last or "All Binance endpoints failed")
 
 def sign_params(params: dict):
     qs  = parse.urlencode(params)
-    sig = hmac.new(SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
-    headers = {"X-MBX-APIKEY": KEY, "User-Agent": USER_AGENT}
+    sig = hmac.new(BINANCE_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    headers = {"X-MBX-APIKEY": BINANCE_KEY, "User-Agent": UA}
     return f"{qs}&signature={sig}", headers
 
-@st.cache_data(ttl=2)  # кэш на 2 секунды, чтобы не долбить API
-def fetch_products_all(option_type: str, exercised: str, invest: str, max_pages=3):
-    ts = server_time_ms()
+# ========= Binance fetch (raw) =========
+@st.cache_data(ttl=2)
+def fetch_products_all_direct(option_type: str, exercised: str, invest: str, pages=3):
+    # time
+    base, code, body = http_get_any("/api/v3/time")
+    if code != 200:
+        raise RuntimeError(f"time error: {code} {body[:200]}")
+    ts = json.loads(body)["serverTime"]
+
     out = []
-    for idx in range(1, max_pages+1):
+    chosen_base = base
+    for idx in range(1, pages+1):
         p = {
             "optionType": option_type,
             "exercisedCoin": exercised,
@@ -92,7 +79,8 @@ def fetch_products_all(option_type: str, exercised: str, invest: str, max_pages=
             "recvWindow": 60000
         }
         qs, hdr = sign_params(p)
-        code, body = http_get_any(f"/sapi/v1/dci/product/list?{qs}", headers=hdr)
+        base, code, body = http_get_any(f"/sapi/v1/dci/product/list?{qs}", headers=hdr)
+        chosen_base = base
         if code != 200:
             raise RuntimeError(f"HTTP {code}: {body[:300]}")
         data = json.loads(body)
@@ -100,9 +88,25 @@ def fetch_products_all(option_type: str, exercised: str, invest: str, max_pages=
         out.extend(page)
         if len(page) < 100:
             break
-    return out
+    return {"items": out, "endpoint": chosen_base}
 
+# ========= Proxy fetch (normalized or raw) =========
+@st.cache_data(ttl=2)
+def fetch_via_proxy(params: dict):
+    if not PROXY_BASE:
+        raise RuntimeError("PROXY_BASE is not set")
+    url = f"{PROXY_BASE}/api/matrix?{parse.urlencode(params)}"
+    code, body = http_get(url, headers={"User-Agent": UA}, timeout=15)
+    if code != 200:
+        raise RuntimeError(f"Proxy error {code}: {body[:300]}")
+    return json.loads(body)
+
+# ========= Normalize to matrix =========
 def normalize(items, min_apr_pct, duration_set, max_strikes, strike_prec=2):
+    """
+    items: список raw продуктов Binance
+    -> { strikes, days, cells, max_apr }
+    """
     mp, strikes_set, days_set = {}, set(), set()
     for it in items:
         try:
@@ -128,50 +132,99 @@ def normalize(items, min_apr_pct, duration_set, max_strikes, strike_prec=2):
             cells[str(s)][str(d)] = {"apr": apr, "pid": pid}
     return {"strikes": strikes, "days": days, "cells": cells, "max_apr": max_apr}
 
-# ===== UI =====
+# ========= UI controls =========
 c1, c2, c3, c4 = st.columns([1.1,1.1,1.1,2])
 with c1: option_type = st.selectbox("Option", ["PUT","CALL"], index=0)
 with c2: exercised   = st.text_input("Exercised", "ETH")
 with c3: invest      = st.text_input("Invest", "USDT")
 with c4: durations_s = st.text_input("Durations (дни, через запятую)", "3,7,14")
 duration_set = [int(x) for x in durations_s.split(",") if x.strip().isdigit()]
-min_apr = st.number_input("Min APR, %", value=0.0, step=0.1)
+min_apr     = st.number_input("Min APR, %", value=0.0, step=0.1)
 max_strikes = st.number_input("Max strikes", 1, 20, 5)
 refresh_sec = st.slider("Автообновление, сек", 2, 30, 5)
 
-status = st.empty()
-try:
-    items = fetch_products_all(option_type, exercised, invest)
-    data  = normalize(items, min_apr, duration_set, max_strikes)
-    if st.session_state["LAST_BASE"]:
-        status.caption(f"Endpoint: {st.session_state['LAST_BASE']}")
-except Exception as e:
-    st.error(f"Ошибка запроса: {e}")
-    st.stop()
+# ========= Fetch strategy =========
+endpoint_used = ""
+data = None
 
+try:
+    if BINANCE_KEY and BINANCE_SECRET:
+        # Пытаемся напрямую (может сработать, если IP не в геофенсе)
+        raw = fetch_products_all_direct(option_type, exercised, invest)
+        endpoint_used = f"Direct: {raw['endpoint']}"
+        data = normalize(raw["items"], min_apr, duration_set, int(max_strikes))
+    else:
+        endpoint_used = "Direct: disabled (no keys)"
+        raise RuntimeError("No direct keys; using proxy")
+
+except Exception as direct_err:
+    # Если прямой доступ не удался — пробуем прокси (если задан)
+    if not PROXY_BASE:
+        st.error(f"Ошибка прямого запроса: {direct_err}\n"
+                 f"Решение: задать PROXY_BASE (ЕС-хост) в Secrets или запустить Streamlit в разрешённом регионе.")
+        st.stop()
+    try:
+        params = {
+            "optionType": option_type,
+            "exercisedCoin": exercised,
+            "investCoin": invest,
+            "minAPR": float(min_apr),
+            "maxStrikes": int(max_strikes),
+            "durations": ",".join(str(d) for d in duration_set) if duration_set else ""
+        }
+        proxy_res = fetch_via_proxy(params)
+        # Прокси может отдавать уже нормализованную структуру
+        if {"strikes","days","cells","max_apr"}.issubset(proxy_res.keys()):
+            data = proxy_res
+        else:
+            # или список raw items
+            items = proxy_res.get("items") or proxy_res.get("list") or proxy_res.get("data") or []
+            data = normalize(items, min_apr, duration_set, int(max_strikes))
+        endpoint_used = f"Proxy: {PROXY_BASE}"
+    except Exception as proxy_err:
+        st.error(f"Ошибка прокси: {proxy_err}")
+        st.stop()
+
+st.caption(endpoint_used)
+
+# ========= Render matrix =========
 strikes, days, cells, max_apr = data["strikes"], data["days"], data["cells"], data["max_apr"]
 
-# Рендерим HTML-таблицу (подсветка максимума)
+# Держим прошлые APR по pid для стрелок
+prev = st.session_state.setdefault("prev_apr_by_pid", {})
+
+def cell_html(cell):
+    apr = float(cell["apr"])
+    pid = str(cell["pid"])
+    delta = None
+    if pid in prev:
+        delta = apr - prev[pid]
+    prev[pid] = apr
+    # стрелки при |Δ| >= 0.05 п.п.
+    arrow = ""
+    if delta is not None and abs(delta) >= 0.05:
+        arrow = "&#9650;" if delta > 0 else "&#9660;"
+    style = 'background:#fff3cd;' if apr == max_apr else ''
+    return f'<td style="border:1px solid #ddd;padding:6px;text-align:right;{style}"><span style="font-variant-numeric:tabular-nums">{apr:0.1f}{arrow}</span></td>'
+
 rows = []
 rows.append('<table style="border-collapse:collapse;width:100%;table-layout:fixed">')
+# header
 rows.append('<thead><tr><th style="position:sticky;left:0;background:#fafafa;border:1px solid #ddd;padding:6px;text-align:center">Days\\Str</th>')
 for s in strikes:
     rows.append(f'<th style="border:1px solid #ddd;padding:6px;text-align:center">{s}</th>')
 rows.append('</tr></thead><tbody>')
+# body
 for d in days:
     rows.append(f'<tr><th style="position:sticky;left:0;background:#fafafa;border:1px solid #ddd;padding:6px;text-align:center">{d}</th>')
     for s in strikes:
         cell = cells.get(str(s), {}).get(str(d))
-        if not cell:
-            rows.append('<td style="border:1px solid #eee;padding:6px;"></td>')
-        else:
-            apr = float(cell["apr"])
-            style = 'background:#fff3cd;' if apr == max_apr else ''
-            rows.append(f'<td style="border:1px solid #ddd;padding:6px;text-align:right;{style}">{apr:0.1f}</td>')
+        rows.append('<td style="border:1px solid #eee;padding:6px;"></td>' if not cell else cell_html(cell))
     rows.append('</tr>')
 rows.append('</tbody></table>')
+
 st.markdown("".join(rows), unsafe_allow_html=True)
 st.caption(f"max APR: {max_apr:0.1f}% • updated {time.strftime('%H:%M:%S')} • автообновление {refresh_sec}s")
 
-# Автообновление страницы
+# Автообновление (JS)
 st.markdown(f"<script>setTimeout(()=>location.reload(), {int(refresh_sec)*1000});</script>", unsafe_allow_html=True)
